@@ -1,6 +1,8 @@
 import express from 'express';
 import path from 'path';
 import crypto from 'crypto';
+import { DatabaseSync } from 'node:sqlite';
+import fs from 'node:fs';
 import pg from 'pg';
 import { fileURLToPath } from 'url';
 
@@ -39,10 +41,50 @@ let products=[
 ];
 let sales=[];
 let credits=[]; let dispatches=[]; let movements=[]; let customers=[],suppliers=[],branches=[{id:1,name:"Matriz",active:true}],registers=[{id:1,name:"Caja 1",branchId:1,active:true}],cashSessions=[],cashMovements=[]; let settings={warehouseDispatch:false,noteHeader:'NOTA DE VENTA',noteFooter:'Gracias por su preferencia',creditHeader:'NOTA DE CRÉDITO',creditFooter:'Documento de devolución'};
-const pool=process.env.DATABASE_URL?new pg.Pool({connectionString:process.env.DATABASE_URL,ssl:process.env.DATABASE_URL.includes('localhost')?false:{rejectUnauthorized:false}}):null;
-async function save(){if(pool)await pool.query('INSERT INTO pos_state(id,data) VALUES (1,$1) ON CONFLICT(id) DO UPDATE SET data=EXCLUDED.data',[JSON.stringify({products,sales,credits,dispatches,movements,settings,ticketSettings,customers,suppliers,branches,registers,cashSessions,cashMovements})]);}
-async function boot(){if(pool){await pool.query('CREATE TABLE IF NOT EXISTS pos_state(id integer PRIMARY KEY,data jsonb NOT NULL)');const r=await pool.query('SELECT data FROM pos_state WHERE id=1');if(r.rows.length){const d=r.rows[0].data;products=d.products||products;sales=d.sales||sales;credits=d.credits||[];dispatches=d.dispatches||[];movements=d.movements||[];settings={...settings,...d.settings};customers=d.customers||[];suppliers=d.suppliers||[];branches=d.branches||branches;registers=d.registers||registers;cashSessions=d.cashSessions||[];cashMovements=d.cashMovements||[];ticketSettings=d.ticketSettings||ticketSettings;}else await save();}}
-let ticketSettings={businessName:'MiNegocio',branch:'Matriz',address:'',phone:'',rfc:'',header:'',footer:'¡Gracias por su compra!',paperWidth:80,showTax:true,logo:"",logoPosition:"center",logoWidth:90,autoPrint:false};
+// Seleccione DB_ENGINE=sqlite o DB_ENGINE=postgres. Nunca incluya la base en Git.
+const engine=(process.env.DB_ENGINE||'sqlite').toLowerCase();
+if(!['sqlite','postgres'].includes(engine)) throw Error('DB_ENGINE debe ser sqlite o postgres');
+const dataDir=path.resolve(process.env.DATA_DIR||path.join(__dirname,'data'));
+let db=null, pool=null;
+if(engine==='sqlite'){
+ fs.mkdirSync(dataDir,{recursive:true});
+ db=new DatabaseSync(path.join(dataDir,'minegocio.sqlite'));
+ db.exec('PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000; CREATE TABLE IF NOT EXISTS pos_state (id INTEGER PRIMARY KEY CHECK(id=1), data TEXT NOT NULL);');
+}else{
+ if(!process.env.DATABASE_URL) throw Error('DATABASE_URL requerida para PostgreSQL');
+ pool=new pg.Pool({connectionString:process.env.DATABASE_URL,max:5,ssl:process.env.PGSSL==='true'?{rejectUnauthorized:true}:undefined});
+}
+function snapshot(){return {products,sales,credits,dispatches,movements,settings,ticketSettings,customers,suppliers,branches,registers,cashSessions,cashMovements};}
+async function save(){
+ const payload=JSON.stringify(snapshot());
+ if(db) db.prepare('INSERT INTO pos_state(id,data) VALUES (1,?) ON CONFLICT(id) DO UPDATE SET data=excluded.data').run(payload);
+ else await pool.query('INSERT INTO pos_state(id,data) VALUES (1,$1::jsonb) ON CONFLICT(id) DO UPDATE SET data=excluded.data',[payload]);
+}
+async function boot(){
+ let row;
+ if(db) row=db.prepare('SELECT data FROM pos_state WHERE id=1').get();
+ else {
+  await pool.query('CREATE TABLE IF NOT EXISTS pos_state (id INTEGER PRIMARY KEY CHECK(id=1), data JSONB NOT NULL)');
+  row=(await pool.query('SELECT data FROM pos_state WHERE id=1')).rows[0];
+ }
+ if(row){const d=typeof row.data==='string'?JSON.parse(row.data):row.data;products=d.products||products;sales=d.sales||sales;credits=d.credits||[];dispatches=d.dispatches||[];movements=d.movements||[];settings={...settings,...d.settings};customers=d.customers||[];suppliers=d.suppliers||[];branches=d.branches||branches;registers=d.registers||registers;cashSessions=d.cashSessions||[];cashMovements=d.cashMovements||[];ticketSettings={...ticketSettings,...d.ticketSettings};}else await save();
+}
+// Cola de escrituras: impide carreras dentro de una instancia Node.
+// PostgreSQL con multiples replicas necesita tablas normalizadas y transacciones.
+let releaseWrite=()=>{};
+let writeQueue=Promise.resolve();
+app.use('/api',(req,res,next)=>{
+ if(!['POST','PUT','PATCH','DELETE'].includes(req.method)||req.path==='/login'||req.path==='/logout')return next();
+ const previous=writeQueue;
+ let release;
+ writeQueue=new Promise(resolve=>{release=resolve});
+ previous.then(()=>{
+  let finished=false;
+  const done=()=>{if(!finished){finished=true;release()}};
+  res.once('finish',done);res.once('close',done);next();
+ }).catch(next);
+});
+let ticketSettings={businessName:'MiNegocio',branch:'Matriz',address:'',phone:'',rfc:'',header:'',footer:'¡Gracias por su compra!',paperWidth:80,showTax:true,logo:"",logoPosition:"center",logoWidth:90,autoPrint:false,showDiscounts:true,showNotes:true};
 
 app.post('/api/login',(req,res)=>{
   const {username,password}=req.body||{};
@@ -60,7 +102,7 @@ app.get('/api/ticket-settings',auth,(req,res)=>res.json(ticketSettings));
 app.put('/api/ticket-settings',auth,async(req,res)=>{
   if(req.user.role!=='Administrador') return res.status(403).json({error:'Solo el administrador puede modificar el ticket'});
   const b=req.body||{};
-  ticketSettings={businessName:String(b.businessName||'MiNegocio').slice(0,80),branch:String(b.branch||'Matriz').slice(0,80),address:String(b.address||'').slice(0,180),phone:String(b.phone||'').slice(0,40),rfc:String(b.rfc||'').slice(0,30),header:String(b.header||'').slice(0,240),footer:String(b.footer||'¡Gracias por su compra!').slice(0,240),paperWidth:Number(b.paperWidth)===58?58:80,showTax:b.showTax!==false,logo:String(b.logo||"").slice(0,1200000),logoPosition:["left","center","right"].includes(b.logoPosition)?b.logoPosition:"center",logoWidth:Math.min(200,Math.max(30,Number(b.logoWidth)||90)),autoPrint:b.autoPrint===true};
+  ticketSettings={businessName:String(b.businessName||'MiNegocio').slice(0,80),branch:String(b.branch||'Matriz').slice(0,80),address:String(b.address||'').slice(0,180),phone:String(b.phone||'').slice(0,40),rfc:String(b.rfc||'').slice(0,30),header:String(b.header||'').slice(0,240),footer:String(b.footer||'¡Gracias por su compra!').slice(0,240),paperWidth:Number(b.paperWidth)===58?58:80,showTax:b.showTax!==false,logo:String(b.logo||"").slice(0,1200000),logoPosition:["left","center","right"].includes(b.logoPosition)?b.logoPosition:"center",logoWidth:Math.min(200,Math.max(30,Number(b.logoWidth)||90)),autoPrint:b.autoPrint===true,showDiscounts:b.showDiscounts!==false,showNotes:b.showNotes!==false};
   await save(); res.json(ticketSettings);
 });
 app.post('/api/sales',auth,async(req,res)=>{
@@ -68,11 +110,13 @@ app.post('/api/sales',auth,async(req,res)=>{
   if(!items?.length) return res.status(400).json({error:'Venta vacía'});
   for(const it of items){const p=products.find(x=>x.id===it.id);if(!p||!Number.isInteger(it.qty)||it.qty<=0||it.qty>p.stock)return res.status(400).json({error:`Existencia insuficiente: ${p?.name||it.id}`})}
   let normalized;try{normalized=items.map(it=>{const p=products.find(x=>x.id===it.id);const requested=Number(it.price??p.price),discount=Number(it.discount||0);if(!Number.isFinite(requested)||requested<0||!Number.isFinite(discount)||discount<0||discount>requested)throw Error('Precio o descuento inválido');if(req.user.role!=='Administrador'&&(requested!==p.price||discount>0))throw Error('Solo un administrador puede modificar precios o descuentos');return {id:p.id,barcode:p.barcode,name:p.name,qty:it.qty,price:requested,discount,subtotal:Math.round((requested-discount)*it.qty*100)/100}})}catch(e){return res.status(403).json({error:e.message})}
-  const total=normalized.reduce((a,i)=>a+i.subtotal,0);
+  const total=Number(normalized.reduce((a,i)=>a+i.subtotal,0).toFixed(2));
+  const originalTotal=Number(normalized.reduce((a,i)=>a+i.price*i.qty,0).toFixed(2));
+  const discountTotal=Number((originalTotal-total).toFixed(2));
   const received=payment==='Efectivo'?Number(cashReceived):null;
   if(payment==='Efectivo'&&(!Number.isFinite(received)||received<total)) return res.status(400).json({error:'El efectivo recibido es insuficiente'});
   normalized.forEach(it=>{products.find(p=>p.id===it.id).stock-=it.qty});
-  const sale={id:sales.length+1,folio:`V-${String(sales.length+1).padStart(6,'0')}`,date:new Date().toISOString(),items:normalized,subtotal:total,tax:total-(total/1.16),total,payment:payment||'Efectivo',cashReceived:received,change:received==null?null:Number((received-total).toFixed(2)),cashier:req.user.name,customerId:customerId||null,customerName:customers.find(c=>c.id===Number(customerId))?.name||'Público general',notes:String(notes||'').slice(0,500),registerId:Number(registerId),cashSessionId:activeSession.id,business:ticketSettings.businessName,branch:ticketSettings.branch,ticketSettings:{...ticketSettings}};
+  const sale={id:sales.length+1,folio:`V-${String(sales.length+1).padStart(6,'0')}`,date:new Date().toISOString(),items:normalized,subtotal:originalTotal,discountTotal,tax:total-(total/1.16),total,payment:payment||'Efectivo',cashReceived:received,change:received==null?null:Number((received-total).toFixed(2)),cashier:req.user.name,customerId:customerId||null,customerName:customers.find(c=>c.id===Number(customerId))?.name||'Público general',notes:String(notes||'').slice(0,500),registerId:Number(registerId),cashSessionId:activeSession.id,business:ticketSettings.businessName,branch:ticketSettings.branch,ticketSettings:{...ticketSettings}};
   sale.dispatchStatus=settings.warehouseDispatch?'Pendiente':'No requerido'; if(settings.warehouseDispatch)dispatches.push({saleId:sale.id,folio:sale.folio,status:'Pendiente',date:sale.date});
   sales.push(sale);await save();res.json(sale);
 });
@@ -85,7 +129,7 @@ app.get('/api/sales',auth,(req,res)=>res.json(sales.slice().reverse()));
 app.get('/api/dispatches',auth,(req,res)=>res.json(dispatches));
 app.post('/api/dispatches/:id/confirm',auth,async(req,res)=>{const d=dispatches.find(x=>x.saleId===Number(req.params.id));if(!d)return res.status(404).json({error:'No existe despacho'});if(d.status!=='Pendiente')return res.status(409).json({error:'Ya despachado'});d.status='Entregado';d.by=req.user.name;d.dispatchedAt=new Date().toISOString();const sale=sales.find(x=>x.id===d.saleId);sale.dispatchStatus='Entregado';await save();res.json(d)});
 app.get('/api/credits',auth,(req,res)=>res.json(credits));
-app.post('/api/credits',auth,async(req,res)=>{const {saleId,items,reason}=req.body||{};const sale=sales.find(x=>x.id===Number(saleId));if(!sale)return res.status(404).json({error:'Venta no encontrada'});if(!Array.isArray(items)||!items.length)return res.status(400).json({error:'Indica productos a devolver'});const normalized=[];for(const it of items){const original=sale.items.find(x=>x.id===Number(it.id));const returned=credits.flatMap(c=>c.saleId===sale.id?c.items:[]).filter(x=>x.id===Number(it.id)).reduce((a,x)=>a+x.qty,0);const qty=Number(it.qty);if(!original||!Number.isInteger(qty)||qty<=0||qty+returned>original.qty)return res.status(400).json({error:'Cantidad de devolución inválida'});normalized.push({...original,qty,subtotal:Number((original.price*qty).toFixed(2))})}const credit={id:credits.length+1,folio:`NC-${String(credits.length+1).padStart(6,'0')}`,saleId:sale.id,saleFolio:sale.folio,date:new Date().toISOString(),items:normalized,total:Number(normalized.reduce((a,x)=>a+x.subtotal,0).toFixed(2)),reason:String(reason||'Devolución').slice(0,300),cashier:req.user.name};for(const it of normalized){const product=products.find(p=>p.id===it.id);if(product)product.stock+=it.qty;movements.push({type:'Devolución',productId:it.id,qty:it.qty,reference:credit.folio,date:credit.date})}credits.push(credit);await save();res.json(credit)});
+app.post('/api/credits',auth,async(req,res)=>{const {saleId,items,reason}=req.body||{};const sale=sales.find(x=>x.id===Number(saleId));if(!sale)return res.status(404).json({error:'Venta no encontrada'});if(!Array.isArray(items)||!items.length)return res.status(400).json({error:'Indica productos a devolver'});const normalized=[];for(const it of items){const original=sale.items.find(x=>x.id===Number(it.id));const returned=credits.flatMap(c=>c.saleId===sale.id?c.items:[]).filter(x=>x.id===Number(it.id)).reduce((a,x)=>a+x.qty,0);const qty=Number(it.qty);if(!original||!Number.isInteger(qty)||qty<=0||qty+returned>original.qty)return res.status(400).json({error:'Cantidad de devolución inválida'});normalized.push({...original,qty,subtotal:Number(((original.price-(original.discount||0))*qty).toFixed(2))})}const credit={id:credits.length+1,folio:`NC-${String(credits.length+1).padStart(6,'0')}`,saleId:sale.id,saleFolio:sale.folio,date:new Date().toISOString(),items:normalized,total:Number(normalized.reduce((a,x)=>a+x.subtotal,0).toFixed(2)),reason:String(reason||'Devolución').slice(0,300),cashier:req.user.name};for(const it of normalized){const product=products.find(p=>p.id===it.id);if(product)product.stock+=it.qty;movements.push({type:'Devolución',productId:it.id,qty:it.qty,reference:credit.folio,date:credit.date})}credits.push(credit);await save();res.json(credit)});
 app.post('/api/products',auth,admin,async(req,res)=>{const b=req.body||{};if(!String(b.name||'').trim()||!departments.includes(b.category)||!Number.isFinite(Number(b.price))||Number(b.price)<0||!Number.isInteger(Number(b.stock))||Number(b.stock)<0)return res.status(400).json({error:'Datos de producto inválidos'});if(b.image&&!/^data:image\/(png|jpeg|webp);base64,[a-zA-Z0-9+/=]+$/.test(b.image))return res.status(400).json({error:'Imagen inválida'});if(b.image?.length>1200000)return res.status(413).json({error:'Imagen demasiado grande (máximo ~850 KB)'});const product={id:Math.max(0,...products.map(x=>x.id))+1,name:String(b.name).slice(0,120),barcode:String(b.barcode||'').slice(0,80),category:b.category,price:Number(b.price),stock:Number(b.stock),image:b.image||''};products.push(product);await save();res.status(201).json(product)});
 app.put('/api/products/:id',auth,admin,async(req,res)=>{const p=products.find(x=>x.id===Number(req.params.id));if(!p)return res.status(404).json({error:'No encontrado'});const b=req.body||{};if(!String(b.name||'').trim()||!departments.includes(b.category)||!Number.isFinite(Number(b.price))||Number(b.price)<0||!Number.isInteger(Number(b.stock))||Number(b.stock)<0)return res.status(400).json({error:'Datos inválidos'});if(b.image&&(!/^data:image\/(png|jpeg|webp);base64,[a-zA-Z0-9+/=]+$/.test(b.image)||b.image.length>1200000))return res.status(400).json({error:'Imagen inválida o grande'});const delta=Number(b.stock)-p.stock;Object.assign(p,{name:String(b.name).slice(0,120),barcode:String(b.barcode||'').slice(0,80),category:b.category,price:Number(b.price),stock:Number(b.stock),image:b.image||''});if(delta)movements.push({type:'Ajuste',productId:p.id,qty:delta,date:new Date().toISOString(),by:req.user.name});await save();res.json(p)});
 
@@ -103,4 +147,4 @@ app.post('/api/cash-sessions/:id/close',auth,async(req,res)=>{const row=cashSess
 app.get('/api/cash-movements',auth,(req,res)=>res.json(cashMovements));
 app.get('/api/reports',auth,(req,res)=>{const gross=sales.reduce((a,x)=>a+x.total,0),refunds=credits.reduce((a,x)=>a+x.total,0);const byPayment=Object.fromEntries([...new Set(sales.map(s=>s.payment))].map(k=>[k,Number(sales.filter(s=>s.payment===k).reduce((a,s)=>a+s.total,0).toFixed(2))]));res.json({salesCount:sales.length,gross,refunds,net:Math.round((gross-refunds)*100)/100,byPayment,lowStock:products.filter(p=>p.stock<=5).map(p=>({name:p.name,stock:p.stock})),registers:registers.map(r=>({...r,open:cashSessions.some(s=>s.registerId===r.id&&s.status==='Abierta')}))})});
 
-boot().then(()=>app.listen(process.env.PORT||3000,'0.0.0.0',()=>console.log('POS listo'))).catch(e=>{console.error('No se pudo iniciar base de datos',e);process.exit(1)});
+try{await boot();app.listen(process.env.PORT||3000,'0.0.0.0',()=>console.log('POS listo; motor: '+engine));}catch(e){console.error('No se pudo iniciar base de datos',e);process.exit(1)}
