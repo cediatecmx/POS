@@ -64,15 +64,15 @@ app.put('/api/ticket-settings',auth,async(req,res)=>{
   await save(); res.json(ticketSettings);
 });
 app.post('/api/sales',auth,async(req,res)=>{
-  const {items,payment,cashReceived,registerId}=req.body||{}; const activeSession=cashSessions.find(x=>x.registerId===Number(registerId)&&x.status==='Abierta'); if(!activeSession)return res.status(400).json({error:'Abre una caja antes de cobrar'});
+  const {items,payment,cashReceived,registerId,customerId,notes}=req.body||{}; const activeSession=cashSessions.find(x=>x.registerId===Number(registerId)&&x.status==='Abierta'); if(!activeSession)return res.status(400).json({error:'Abre una caja antes de cobrar'});
   if(!items?.length) return res.status(400).json({error:'Venta vacía'});
   for(const it of items){const p=products.find(x=>x.id===it.id);if(!p||!Number.isInteger(it.qty)||it.qty<=0||it.qty>p.stock)return res.status(400).json({error:`Existencia insuficiente: ${p?.name||it.id}`})}
-  const normalized=items.map(it=>{const p=products.find(x=>x.id===it.id);return {id:p.id,barcode:p.barcode,name:p.name,qty:it.qty,price:p.price,subtotal:p.price*it.qty}});
+  let normalized;try{normalized=items.map(it=>{const p=products.find(x=>x.id===it.id);const requested=Number(it.price??p.price),discount=Number(it.discount||0);if(!Number.isFinite(requested)||requested<0||!Number.isFinite(discount)||discount<0||discount>requested)throw Error('Precio o descuento inválido');if(req.user.role!=='Administrador'&&(requested!==p.price||discount>0))throw Error('Solo un administrador puede modificar precios o descuentos');return {id:p.id,barcode:p.barcode,name:p.name,qty:it.qty,price:requested,discount,subtotal:Math.round((requested-discount)*it.qty*100)/100}})}catch(e){return res.status(403).json({error:e.message})}
   const total=normalized.reduce((a,i)=>a+i.subtotal,0);
   const received=payment==='Efectivo'?Number(cashReceived):null;
   if(payment==='Efectivo'&&(!Number.isFinite(received)||received<total)) return res.status(400).json({error:'El efectivo recibido es insuficiente'});
   normalized.forEach(it=>{products.find(p=>p.id===it.id).stock-=it.qty});
-  const sale={id:sales.length+1,folio:`V-${String(sales.length+1).padStart(6,'0')}`,date:new Date().toISOString(),items:normalized,subtotal:total,tax:total-(total/1.16),total,payment:payment||'Efectivo',cashReceived:received,change:received==null?null:Number((received-total).toFixed(2)),cashier:req.user.name,registerId:Number(registerId),cashSessionId:activeSession.id,business:ticketSettings.businessName,branch:ticketSettings.branch,ticketSettings:{...ticketSettings}};
+  const sale={id:sales.length+1,folio:`V-${String(sales.length+1).padStart(6,'0')}`,date:new Date().toISOString(),items:normalized,subtotal:total,tax:total-(total/1.16),total,payment:payment||'Efectivo',cashReceived:received,change:received==null?null:Number((received-total).toFixed(2)),cashier:req.user.name,customerId:customerId||null,customerName:customers.find(c=>c.id===Number(customerId))?.name||'Público general',notes:String(notes||'').slice(0,500),registerId:Number(registerId),cashSessionId:activeSession.id,business:ticketSettings.businessName,branch:ticketSettings.branch,ticketSettings:{...ticketSettings}};
   sale.dispatchStatus=settings.warehouseDispatch?'Pendiente':'No requerido'; if(settings.warehouseDispatch)dispatches.push({saleId:sale.id,folio:sale.folio,status:'Pendiente',date:sale.date});
   sales.push(sale);await save();res.json(sale);
 });
